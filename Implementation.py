@@ -404,9 +404,38 @@ class EarthSpecificBlock(nn.Module):
             # If two pixels are not adjacent, then mask the attention between them
             # Your can set the matrix element to -1000 when it is not adjacent, then add it to the attention
             mask = self.gen_mask(x)
+        else:
+            # FIXME 零矩阵掩码
+            mask = no_mask
 
         # 重构数据以计算 window attention
         x_window = torch.reshape(x, shape=(x.shape[0], Z//self.window_size[0], self.window_size[0], H//self.window_size[1], self.window_size[1], W//self.window_size[2], self.window_size[2], x.shape[-1]))
+        x_window = torch.permute(x_window, (0, 1, 3, 5, 2, 4, 6 ,7))
+
+        # 将数据堆叠为 3d 立方体，用于在每个立方体中计算 attention
+        x_window = torch.reshape(x_window, shape=(-1, self.window_size[0]*self.window_size[1]*self.window_size[2], x.shape[-1]))
+
+        x_window = self.attention(x, mask)
+
+        # 将数据重构为原始形状
+        x = torch.reshape(x_window, shape=((-1, Z//self.window_size[0], H//self.window_size[1], W//self.window_size[2], self.window_size[0], self.window_size[1], self.window_size[2], x_window.shape[-1])))
+        x = torch.permute(x, (0, 1, 4, 2, 5, 3, 6, 7))
+
+        x = torch.reshape(x_window, shape=ori_shape)
+
+        if roll:
+            x = torch.roll(x, shifts=[-1*self.window_size[0]//2, -1*self.window_size[1]//2, -1*self.window_size[2]//2])
+
+        # FIXME 剪切零填充？
+        x = Crop3D(x)
+
+        # 将 tensor 转回输入形状
+        x = torch.reshape(x, shape=(x.shape[0], x.shape[1]*x.shape[2]*x.shape[3], x.shape[4]))
+
+        # 主要计算部分
+        x = shortcut + self.drop_path(self.norm1(x))
+        x = x + self.drop_path(self.norm2(self.linear(x)))
+
 
     # FIXME
     def gen_mask(x):
@@ -423,14 +452,152 @@ class EarthSpecificLayer(nn.Module):
         # 构建基本块
         for i in range(depth):
             self.blocks.append(EarthSpecificBlock(dim, drop_path_ratio_list[i], heads))
-      
+
+    
+    def forward(self, x, Z, H, W):
+        for i in range(self.depth):
+            # 每两个块滚动一次
+            if i % 2 == 0:
+                # FIXME 需要实现滚动操作
+                self.blocks[i](x, Z, H, W, roll=False)
+            else:
+                self.blocks[i](x, Z, H, W, roll=True)
+        return x
+    
+
+class UpSample(nn.Module):
+    def __init__(self, input_dim, output_dim) -> None:
+        super().__init__()
+        # 无偏置线性层增加数据的通道
+        self.linear1 = nn.Linear(input_dim, output_dim*4, bias=False)
+        # 无偏置线性层混合数据
+        self.linear2 = nn.Linear(output_dim, output_dim, bias=False)
+        # 归一化
+        self.norm = nn.LayerNorm(output_dim)
+
+    def forward(self, x):
+        x = self.linear1(x)
+
+        # 重构 x 以增加分辨率：简单地修改顺序并从 (8, 180, 91) 上采样为 （8，360，182）
+        # reshape x 以便于上采样
+        x = torch.reshape(x, shape=(x.shape[0], 8, 180, 91, 2, 2, x.shape[-1]//4))
+        # 修改 x 的顺序
+        x = torch.permute(x, (0, 1, 2, 4, 3, 5, 6))
+        # reshape
+        x = torch.reshape(x, shape=(x.shape[0], 8, 360, 182, x.shape[-1]))
+
+        # FIXME 剪除 output 到 input 的形状
+        x = Crop3D(x)
+
+        # reshape x back
+        x = torch.reshape(x, shape=(x.shape[0], x.shape[1]*x.shape[2]*x.shape[3], x.shape[-1]))
+
+        x = self.norm(x)
+
+        x = self.linear2(x)
+        return x
+
+
+class DownSample(nn.Module):
+    def __init__(self, dim) -> None:
+        super().__init__()
+        self.linear = nn.Linear(4*dim, 2*dim, bias=False)
+        self.norm = nn.LayerNorm(4*dim)
+
+    def forward(self, x, Z, H, W):
+        x = torch.reshape(x, shape=(x.shape[0], Z, H, W, x.shape[-1]))
+
+        # FIXME 填充以便于下采样
+        x = Pad3D(x)
+
+        # 重构以降低分辨率，(8, 360, 182) -> (8, 180, 91)
+        Z, H, W = x.shape
+        x = torch.reshape(x, shape=(x.shape[0], Z, H//2, 2, W//2, 2, x.shapep[-1]))
+        x = torch.permute(x, (0, 1, 2, 4, 3 ,5 ,6))
+        x = torch.reshape(x, shape=(x.shape[0], Z*(H//2)*(W//2), 4*x.shape[-1]))
+
+        x = self.norm(x)
+        x = self.linear(x)
+        return x
+
+
+class PatchRecovery(nn.Module):
+    def __init__(self, dim) -> None:
+        super().__init__()
+        # FIXME 在 PatchEmbedding 类中使用了 (2, 4, 4) 的 patch_size，不知此处是否为同一个
+        self.conv = nn.ConvTranspose3d(in_channels=dim, out_channels=5, kernel_size=patch_size, stride=patch_size)
+        self.conv_surface = nn.ConvTranspose2d(in_channels=dim, out_channels=4, kernel_size=patch_size[1:], stride=patch_size[1:])
+
+    def forward(self, x, Z, H, W):
+        # The inverse operation of the patch embedding operation, patch_size = (2, 4, 4) as in the original paper
+        x = torch.permute(x, (0, 2, 1))
+        x = torch.reshape(x, shape=(x.shape[0], x.shape[1], Z, H, W))
+
+        output = self.conv(x[:,:,1:,:,:])
+        output_surface = self.conv_surface(x[:,:,0,:,:])
+
+        # FIXME 剪除零填充
+        output = Crop3D(output)
+        output_surface = Crop3D(output_surface)
+        return output, output_surface
+
+
 
 class PanguModel:
     def __init__(self):
+        super().__init__()
         drop_path_list = torch.linspace(0, 0.2, 8)
         self._input_layer = PatchEmbedding((2, 4, 4), 192)
 
-        self.layer1 = EarthSpecificLayer
+        # FIXME 伪代码中 drop_path_list 写为 drop_list，请确保此处的正确性
+        self.layer1 = EarthSpecificLayer(2, 192, drop_path_list[:2], 6)
+        self.layer2 = EarthSpecificLayer(6, 383, drop_path_list[6:], 12)
+        self.layer3 = EarthSpecificLayer(6, 384, drop_path_list[6:], 12)
+        self.layer4 = EarthSpecificLayer(2, 192, drop_path_list[:2], 6)
+
+        # 上采样 下采样
+        self.unsample = UpSample(384, 192)
+        self.downsample = DownSample(192)
+
+        # Patch Recovery
+        self._output_layer = PatchRecovery(384)
+
+    def forward(self, input, input_surface):
+        '''
+        骨干结构
+        '''
+        # 将输入域嵌入到patch
+        x = self._input_layer(input, input_surface)
+        
+        # 编码，组合
+        # layer1 (8, 360, 181, C) C=192 
+        x = self.layer1(x, 8, 360, 181)
+
+        # 存储 tensor 用于跳跃链接
+        skip = x
+
+        # 下采样 (8, 360, 181) -> (8, 180, 91)
+        x = self.downsample(x, 8, 360, 181)
+
+        # layer2 (8, 180, 91, 2C) C=192
+        x = self.layer2(x, 8, 180, 91)
+
+        # 解码，组合
+        # Layer3 (8, 180, 91, 2C) C=192
+        x = self.layer3(x, 8, 180, 91)
+
+        # 上采样 (8, 180, 91) -> (8, 360, 181)
+        x = self.unsample(x)
+
+        # layer4 (8, 360, 181, 2C) C=192
+        x = self.layer4(x, 8, 360, 181)
+
+        # skip connection, in last dim ( c from 192 to 384)
+        x = torch.concat(skip, x)
+
+        # 恢复 output
+        output, output_surface = self._output_layer(x)
+        return output, output_surface
 
 
 def Train():
@@ -438,6 +605,35 @@ def Train():
     Training code
     '''
     model = PanguModel()
+
+    epochs = 100
+    for i in range(epochs):
+        # 对每个 epoch，从 1979 遍历到 2017
+        # dataset_length 是训练数据的长度，例如 1979 和 2017 之间的采样
+        # FIXME
+        for step in range(dataset_length):
+            # 加载时间 t 时的气象数据作为 input，加载时间 t+1/3/6/24 时的气象数据作为 output
+            # 注意 数据需要被随即打乱
+            # 注意 input 和 target 需要归一化，详情请查看 Inference()
+            # FIXME LoadData
+            input, input_surface, target, target_surface = LoadData(step)
+
+            # 调用模型获取输出
+            output, output_surface = model(input, input_surface)
+
+            # 使用 MAE loss 来训练
+            # surface loss 的权重为 0.25
+            # 如果需要对不同的场可以使用不同的权重
+            loss = torch.abs(output-target) + torch.abs(output_surface-target_surface) * 0.25
+
+            # FIXME 反向传播
+            Backward(loss)
+
+            # 以 Adam 优化器更新模型参数
+            # 学习率为 5e-4, 权重衰减为 3e-6
+            # FIXME Adam 优化
+            torch.optim.adam()
+    torch.save(model, "./model.pth")
 
 
 # FIXME

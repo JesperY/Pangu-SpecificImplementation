@@ -492,7 +492,6 @@ class EarthAttention3D:
     # Index in the pressure level of query matrix
     coords_zi = RangeTensor(self.window_size[0])
     # Index in the pressure level of key matrix
-    # FIXME -?
     coords_zj = -RangeTensor(self.window_size[0])*self.window_size[0]
 
     # Index in the latitude of query matrix
